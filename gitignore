@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# Allow specific files
+!watch.py
+!login.py
+!README.md
+!CHANGELOG.md
+!.gitignore
