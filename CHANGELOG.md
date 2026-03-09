@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+- Added Telegram config loading from telegram_bot.txt
+- Removed need to keep Telegram token and chat id inside script
+- Added search by item ID
+- Script now uses item_id for numeric input
+- Script now uses name search for non-numeric input
+
 ## 0.1.9
 - Search each item with its own vendors URL
 - Fixed wrong login detection on Vendors page

@@ -2,17 +2,13 @@
 """
 watch_uaro_playwright.py
 
-Fixes added:
-- Correct login detection (no false positives from "module=account&action=logout/view")
-- Only requests page 2 when page 1 actually has a page 2 link
-- Treats "logged_in_no_table" as NON-fatal (means logged in but 0 results/table missing)
-- Keeps dynamic URL-per-item searching
-- Prints lowest offer on the market (even if above limit)
-- Telegram alert when lowest <= limit AND new low
-
-Deps:
-  pip install playwright requests beautifulsoup4
-  python3 -m playwright install firefox
+- Prompts user for item name or item ID, plus price limit
+- If input is numeric -> search by item_id
+- If input is not numeric -> search by name
+- Reads Telegram bot token and chat id from telegram_bot.txt
+- Parses UARO vendors page with BeautifulSoup
+- Prints lowest market ad for each watched item
+- Sends Telegram alert when lowest price is below the set limit
 """
 
 import os
@@ -25,20 +21,40 @@ import requests
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-print("WATCHER VERSION: dynamic-url-per-item-2 (login-detect-fix + page2-detect)")
+print("WATCHER VERSION: dynamic-search-id-or-name-1")
 
 STATE_FILE = "uaro_storage_state.json"
 POLL_SECONDS = 300  # 5 minutes
+TELEGRAM_FILE = "telegram_bot.txt"
 
-# Telegram (optional)
-TG_BOT_TOKEN = ""
-TG_CHAT_ID = ""
+
+def load_telegram_config(filepath: str) -> tuple[str, str]:
+    """
+    Reads telegram_bot.txt:
+      line 1 -> bot token
+      line 2 -> chat id
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        return "", ""
+
+    if len(lines) < 2:
+        print(f"Warning: {filepath} must contain 2 lines: bot token and chat id")
+        return "", ""
+
+    return lines[0], lines[1]
+
+
+TG_BOT_TOKEN, TG_CHAT_ID = load_telegram_config(TELEGRAM_FILE)
 
 
 def tg_send(text: str) -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print(text)
         return
+
     r = requests.post(
         f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
         json={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True},
@@ -47,48 +63,18 @@ def tg_send(text: str) -> None:
     r.raise_for_status()
 
 
-def build_url_page(item_name: str, page_no: int = 1) -> str:
-    params = {
-        "module": "merchant",
-        "action": "vendors",
-        "item_id": "",
-        "name": item_name,          # dynamic query
-        "type": "-1",
-        "merchant_name": "",
-        "vend_price_op": "eq",
-        "vend_price": "",
-    }
-    base = "https://uaro.net/cp/?" + urlencode(params)
-    if page_no <= 1:
-        return base
-    return base + f"&p={page_no}"
-
-
 def classify(page_html: str) -> str:
-    """
-    Returns:
-      ok                 -> logged in and vendors table exists
-      logged_in_no_table -> logged in but table missing (often 0 results or markup change)
-      cloudflare         -> CF interstitial
-      login              -> actual login page
-      recaptcha          -> recaptcha present
-      unknown            -> none of the above
-    """
     h = page_html.lower()
 
-    # Strong logged-in markers from your page
     logged_in = ("you are currently logged in as" in h) or ("module=account&action=logout" in h)
-
     if logged_in:
         if "horizontal-table" in h:
             return "ok"
         return "logged_in_no_table"
 
-    # Cloudflare / bot checks
     if "just a moment" in h or "cf-browser-verification" in h:
         return "cloudflare"
 
-    # Real login page detection (specific!)
     if "module=account&action=login" in h:
         return "login"
 
@@ -104,38 +90,7 @@ def get_title(page_html: str) -> str:
 
 
 def has_page2(page_html: str) -> bool:
-    """
-    Detects whether pagination includes a link to page 2.
-    Based on your markup:
-      <a href="...&p=2" title="Page #2" class="page-num">2</a>
-    """
     return ('title="Page #2"' in page_html) or ("&p=2" in page_html and "page-num" in page_html)
-
-
-def parse_int_limit(s: str) -> int:
-    cleaned = s.strip().replace(",", "").replace(" ", "")
-    if not cleaned.isdigit():
-        raise ValueError(f"Not a number: {s!r}")
-    return int(cleaned)
-
-
-def prompt_items_and_limits() -> dict[str, int]:
-    print("\nEnter items and limits as pairs. Blank item name to finish.")
-    print("Example:\n  Survivor's Manteau\n  150000\n  Vali's Manteau\n  400000\n")
-
-    items: dict[str, int] = {}
-    while True:
-        name = input("Item name (blank to finish): ").strip()
-        if not name:
-            break
-        limit_raw = input("Limit (z): ").strip()
-        limit_val = parse_int_limit(limit_raw)
-        items[name] = limit_val
-        print(f"Added: {name!r} <= {limit_val:,} z\n")
-
-    if not items:
-        raise SystemExit("No items provided. Exiting.")
-    return items
 
 
 def normalize_text(s: str) -> str:
@@ -152,10 +107,90 @@ def parse_price_to_int(price_text: str) -> int | None:
     return int(m.group(1).replace(",", ""))
 
 
+def parse_int_limit(s: str) -> int:
+    cleaned = s.strip().replace(",", "").replace(" ", "")
+    if not cleaned.isdigit():
+        raise ValueError(f"Not a number: {s!r}")
+    return int(cleaned)
+
+
+def is_numeric_search(value: str) -> bool:
+    return value.strip().isdigit()
+
+
+def build_url_page(search_value: str, page_no: int = 1) -> str:
+    """
+    If search_value is numeric -> use item_id
+    Else -> use name
+    """
+    search_value = search_value.strip()
+
+    if is_numeric_search(search_value):
+        item_id = search_value
+        name = ""
+    else:
+        item_id = ""
+        name = search_value
+
+    params = {
+        "module": "merchant",
+        "action": "vendors",
+        "item_id": item_id,
+        "name": name,
+        "type": "-1",
+        "merchant_name": "",
+        "vend_price_op": "eq",
+        "vend_price": "",
+    }
+
+    base = "https://uaro.net/cp/?" + urlencode(params)
+    if page_no <= 1:
+        return base
+    return base + f"&p={page_no}"
+
+
+def prompt_items_and_limits() -> dict[str, dict]:
+    """
+    Returns:
+      {
+        "Goibne's Armor": {"search": "Goibne's Armor", "limit": 500000},
+        "5124": {"search": "5124", "limit": 120000}
+      }
+    """
+    print("\nEnter item name OR item ID, then limit. Blank input to finish.")
+    print("Examples:")
+    print("  Survivor's Manteau")
+    print("  150000")
+    print("  5124")
+    print("  400000\n")
+
+    items: dict[str, dict] = {}
+
+    while True:
+        search_value = input("Item name or item ID (blank to finish): ").strip()
+        if not search_value:
+            break
+
+        limit_raw = input("Limit (z): ").strip()
+        limit_val = parse_int_limit(limit_raw)
+
+        items[search_value] = {
+            "search": search_value,
+            "limit": limit_val,
+        }
+
+        mode = "ID" if is_numeric_search(search_value) else "name"
+        print(f"Added: {search_value!r} ({mode} search) <= {limit_val:,} z\n")
+
+    if not items:
+        raise SystemExit("No items provided. Exiting.")
+
+    return items
+
+
 def extract_offers(page_html: str) -> list[dict]:
     """
-    Extract offers from the vendors table.
-    Returns list of dicts with keys: item_text, price, merchant, shop, position
+    Extract offers from vendors table.
     """
     soup = BeautifulSoup(page_html, "html.parser")
     table = soup.select_one("table.horizontal-table")
@@ -210,8 +245,8 @@ def auth_fail(page_html: str, url: str, status: str) -> None:
 
 
 def main():
-    watch = prompt_items_and_limits()  # item -> limit
-    last_notified: dict[str, int] = {}  # item -> last alerted price
+    watch = prompt_items_and_limits()
+    last_notified: dict[str, int] = {}
 
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=True)
@@ -222,9 +257,10 @@ def main():
             try:
                 best_offer: dict[str, dict | None] = {item: None for item in watch.keys()}
 
-                for item in watch.keys():
-                    # Page 1 always
-                    url1 = build_url_page(item, 1)
+                for label, cfg in watch.items():
+                    search_value = cfg["search"]
+
+                    url1 = build_url_page(search_value, 1)
                     page.goto(url1, wait_until="domcontentloaded")
                     html1 = page.content()
 
@@ -233,15 +269,13 @@ def main():
                         auth_fail(html1, url1, status1)
                         raise SystemExit(2)
 
-                    # status1 is ok or logged_in_no_table
                     for off in extract_offers(html1):
-                        cur = best_offer[item]
+                        cur = best_offer[label]
                         if cur is None or off["price"] < cur["price"]:
-                            best_offer[item] = off
+                            best_offer[label] = off
 
-                    # Only fetch page 2 if it exists
                     if has_page2(html1):
-                        url2 = build_url_page(item, 2)
+                        url2 = build_url_page(search_value, 2)
                         page.goto(url2, wait_until="domcontentloaded")
                         html2 = page.content()
 
@@ -251,34 +285,35 @@ def main():
                             raise SystemExit(2)
 
                         for off in extract_offers(html2):
-                            cur = best_offer[item]
+                            cur = best_offer[label]
                             if cur is None or off["price"] < cur["price"]:
-                                best_offer[item] = off
+                                best_offer[label] = off
 
-                # Report + alert
-                for item, limit in watch.items():
-                    off = best_offer[item]
+                for label, cfg in watch.items():
+                    limit = cfg["limit"]
+                    off = best_offer[label]
+
                     if off is None:
-                        print(f"[MISS] {item} -> no offers found on the market (0 results)")
+                        print(f"[MISS] {label} -> no offers found on the market (0 results)")
                         continue
 
                     price = off["price"]
                     print(
-                        f"[LOWEST] {item}: {price:,} z (limit {limit:,} z) | "
+                        f"[LOWEST] {label}: {price:,} z (limit {limit:,} z) | "
                         f"{off['merchant']} | {off['shop']} | {off['position']}"
                     )
 
                     under = price <= limit
-                    new_low = (item not in last_notified) or (price < last_notified[item])
+                    new_low = (label not in last_notified) or (price < last_notified[label])
 
                     if under and new_low:
                         tg_send(
-                            f"✅ Price alert: {item}\n"
+                            f"✅ Price alert: {label}\n"
                             f"Lowest on market: {price:,} z (limit {limit:,} z)\n"
                             f"{off['merchant']} | {off['shop']} | {off['position']}\n"
-                            f"{build_url_page(item, 1)}"
+                            f"{build_url_page(cfg['search'], 1)}"
                         )
-                        last_notified[item] = price
+                        last_notified[label] = price
 
             except SystemExit:
                 context.close()
